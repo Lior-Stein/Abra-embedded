@@ -1,36 +1,41 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <sysmon.h>
 
-int main(void)
+void *cpu_sensor_thread(void *arg)
 {
-    while (1) {
+    while (running) {
         FILE *file = fopen("/proc/loadavg", "r");
 
         if (file == NULL) {
             perror("fopen");
-            return 1;
+            return NULL;
         }
 
-        FILE *output = fopen("/tmp/sysmon/cpu.dat", "w");
-
-        if (output == NULL) {
-            perror("fopen output");
-            fclose(file);
-            return 1;
-        }
+     
 
         double load1, load5, load15;
 
+        
         if (fscanf(file, "%lf %lf %lf", &load1, &load5, &load15) == 3) {
-            fprintf(output, "1 min load: %.2f\n", load1);
-            fprintf(output, "5 min load: %.2f\n", load5);
-            fprintf(output, "15 min load: %.2f\n", load15);
+            pthread_mutex_lock(&state.lock);
+
+            state.load1 = load1;
+            state.load5 = load5;
+            state.load15 = load15;
+
+            if (load1 > 1.50) {
+                pthread_cond_signal(&state.alert_cond);
+            }
+
+            pthread_mutex_unlock(&state.lock);
         }
 
-        fclose(output);
+
+        
         fclose(file);
         sleep(5);
     }   
-    return 0;
+    return NULL;
 }

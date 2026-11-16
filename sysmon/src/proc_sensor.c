@@ -3,15 +3,16 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <sysmon.h>
 
-int main(void)
+void *proc_sensor_thread(void *arg)
 {
-    while(1){
+    while(running){
         DIR *dir = opendir("/proc");
 
         if (dir == NULL) {
             perror("opendir");
-            return 1;
+            return NULL;
         }
 
         struct dirent *entry;
@@ -33,17 +34,14 @@ int main(void)
 
 
         closedir(dir);
+        
+        pthread_mutex_lock(&state.lock);
 
-        FILE *output = fopen("/tmp/sysmon/proc.dat", "w");
+        state.total_procs = count;
 
-        if (output == NULL) {
-            perror("fopen output");
-            return 1;
-        }
+        pthread_mutex_unlock(&state.lock);
 
-        fprintf(output, "Active processes: %d\n", count);
-        fclose(output);
         sleep(5);
     }
-    return 0;
+    return NULL;
 }
