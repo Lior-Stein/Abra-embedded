@@ -1,6 +1,6 @@
 
 CC = gcc
-CFLAGS = -Wall -g
+CFLAGS = -Wall -g -Iinc
 
 all: bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
 
@@ -15,3 +15,6 @@ bin/cpu_sensor: src/cpu_sensor.c
 
 bin/proc_sensor: src/proc_sensor.c
 	$(CC) $(CFLAGS) $< -o $@
+
+clean:
+	rm -f bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor

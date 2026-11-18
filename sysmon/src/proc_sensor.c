@@ -3,9 +3,26 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <sysmon_ipc.h>
+#include <fcntl.h>
 
 int main(void)
 {
+    int fifo_fd = open(PROC_FIFO_PATH, O_WRONLY);
+
+    if (fifo_fd == -1) {
+        perror("open PROC FIFO");
+        return 1;
+    }
+
+    FILE *fifo = fdopen(fifo_fd, "w");
+
+    if (fifo == NULL) {
+        perror("fdopen");
+        close(fifo_fd);
+        return 1;
+    }
+
     while(1){
         DIR *dir = opendir("/proc");
 
@@ -34,16 +51,13 @@ int main(void)
 
         closedir(dir);
 
-        FILE *output = fopen("/tmp/sysmon/proc.dat", "w");
+        ProcData data = {count};
 
-        if (output == NULL) {
-            perror("fopen output");
-            return 1;
-        }
+        fwrite(&data, sizeof(data), 1, fifo);
+        fflush(fifo);
 
-        fprintf(output, "Active processes: %d\n", count);
-        fclose(output);
-        sleep(5);
+      
+        sleep(1);
     }
     return 0;
 }

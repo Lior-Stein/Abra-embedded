@@ -1,9 +1,26 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include <sysmon_ipc.h>
+#include <fcntl.h>
 
 int main(void)
 {
+    int fifo_fd = open(CPU_FIFO_PATH, O_WRONLY);
+
+    if (fifo_fd == -1) {
+        perror("open CPU FIFO");
+        return 1;
+    }
+
+    FILE *fifo = fdopen(fifo_fd, "w");
+
+    if (fifo == NULL) {
+        perror("fdopen");
+        close(fifo_fd);
+        return 1;
+    }
+
     while (1) {
         FILE *file = fopen("/proc/loadavg", "r");
 
@@ -12,25 +29,19 @@ int main(void)
             return 1;
         }
 
-        FILE *output = fopen("/tmp/sysmon/cpu.dat", "w");
-
-        if (output == NULL) {
-            perror("fopen output");
-            fclose(file);
-            return 1;
-        }
 
         double load1, load5, load15;
 
         if (fscanf(file, "%lf %lf %lf", &load1, &load5, &load15) == 3) {
-            fprintf(output, "1 min load: %.2f\n", load1);
-            fprintf(output, "5 min load: %.2f\n", load5);
-            fprintf(output, "15 min load: %.2f\n", load15);
+            CpuData data = {load1, load5, load15};
+            
+            fwrite(&data, sizeof(data), 1, fifo);
+            fflush(fifo);
         }
 
-        fclose(output);
+      
         fclose(file);
-        sleep(5);
+        sleep(1);
     }   
     return 0;
 }
