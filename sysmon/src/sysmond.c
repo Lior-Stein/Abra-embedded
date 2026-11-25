@@ -11,7 +11,9 @@
 #include <sys/wait.h>
 
 extern char **environ;
-
+int pipefd[2];
+int cpu_fd, proc_fd;
+pid_t mem_pid, cpu_pid, proc_pid;
 
 int read_full(int fd, void *buffer, size_t size)
 {
@@ -40,9 +42,8 @@ void stop_handler(int sig)
 }
 
 
-int main(void)
+int init(void)
 {
-
 
     struct sigaction sa = {0};
     sa.sa_handler = stop_handler;
@@ -51,7 +52,6 @@ int main(void)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    int pipefd[2];
 
     if (pipe(pipefd) == -1) {
         perror("pipe");
@@ -59,7 +59,7 @@ int main(void)
     }
 
 
-    pid_t mem_pid = fork();
+    mem_pid = fork();
 
     if (mem_pid == -1) {
         perror("fork");
@@ -98,7 +98,7 @@ int main(void)
     }
 
 
-    pid_t cpu_pid = fork();
+    cpu_pid = fork();
 
     if (cpu_pid == -1) {
         perror("fork cpu");
@@ -115,7 +115,7 @@ int main(void)
         _exit(1);
     }
 
-    pid_t proc_pid = fork();
+    proc_pid = fork();
 
     if (proc_pid == -1) {
         perror("fork proc");
@@ -133,21 +133,24 @@ int main(void)
     }
 
 
-    int cpu_fd = open(CPU_FIFO_PATH, O_RDONLY);
+    cpu_fd = open(CPU_FIFO_PATH, O_RDONLY);
 
     if (cpu_fd == -1) {
         perror("open CPU FIFO");
         return 1;
     }
 
-    int proc_fd = open(PROC_FIFO_PATH, O_RDONLY);
+    proc_fd = open(PROC_FIFO_PATH, O_RDONLY);
 
     if (proc_fd == -1) {
         perror("open PROC FIFO");
         return 1;
     }
+    return 0;
+}
 
-
+void processing(void)
+{
 
     while(!stop_requested){
       
@@ -194,6 +197,9 @@ int main(void)
 
 
     }
+}
+
+void teardown(void){
 
     kill(mem_pid, SIGTERM);
     kill(cpu_pid, SIGTERM);
@@ -209,6 +215,18 @@ int main(void)
 
     unlink(CPU_FIFO_PATH);
     unlink(PROC_FIFO_PATH);
+}
+
+
+int main(void)
+{
+    if (init() != 0)
+        return 1;
+
+    processing();
+    teardown();
+
+
 
     return 0;
 }
