@@ -1,6 +1,5 @@
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <sysmon_ipc.h>
 #include <sys/types.h>
@@ -9,30 +8,13 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 extern char **environ;
 int pipefd[2];
 int cpu_fd, proc_fd;
 pid_t mem_pid, cpu_pid, proc_pid;
 
-int read_full(int fd, void *buffer, size_t size)
-{
-    size_t total = 0;
-
-    while (total < size) {
-        ssize_t n = read(fd, (char *)buffer + total, size - total);
-
-        if (n == 0)
-            return 0;
-
-        if (n < 0)
-            return -1;
-
-        total += n;
-    }
-
-    return 1;
-}
 
 volatile sig_atomic_t stop_requested = 0;
 
@@ -41,6 +23,27 @@ void stop_handler(int sig)
     stop_requested = 1;
 }
 
+static pid_t spawn_fifo_sensor(char *path)
+{
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork FIFO sensor");
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        char *args[] = {path, NULL};
+        execve(path, args, environ);
+
+        perror(path);
+        _exit(1);
+    }
+
+    return pid;
+}
 
 int init(void)
 {
@@ -88,8 +91,8 @@ int init(void)
     close(pipefd[1]);
 
     if (mkfifo(CPU_FIFO_PATH, 0666) == -1 && errno != EEXIST) {
-    perror("mkfifo CPU");
-    return 1;
+        perror("mkfifo CPU");
+        return 1;
     }
 
     if (mkfifo(PROC_FIFO_PATH, 0666) == -1 && errno != EEXIST) {
@@ -98,39 +101,13 @@ int init(void)
     }
 
 
-    cpu_pid = fork();
-
-    if (cpu_pid == -1) {
-        perror("fork cpu");
+    cpu_pid = spawn_fifo_sensor("./bin/cpu_sensor");
+    if (cpu_pid == -1)
         return 1;
-    }
 
-    if (cpu_pid == 0) {
-        close(pipefd[0]);
-
-        char *args[] = {"./bin/cpu_sensor", NULL};
-        execve("./bin/cpu_sensor", args, environ);
-
-        perror("execve cpu_sensor");
-        _exit(1);
-    }
-
-    proc_pid = fork();
-
-    if (proc_pid == -1) {
-        perror("fork proc");
+    proc_pid = spawn_fifo_sensor("./bin/proc_sensor");
+    if (proc_pid == -1)
         return 1;
-    }
-
-    if (proc_pid == 0) {
-        close(pipefd[0]);
-
-        char *args[] = {"./bin/proc_sensor", NULL};
-        execve("./bin/proc_sensor", args, environ);
-
-        perror("execve proc_sensor");
-        _exit(1);
-    }
 
 
     cpu_fd = open(CPU_FIFO_PATH, O_RDONLY);
@@ -149,57 +126,116 @@ int init(void)
     return 0;
 }
 
+static int read_sample(const struct pollfd *channel, void *buffer,
+                       size_t size, size_t *received)
+{
+    if (channel->revents & (POLLERR | POLLNVAL))
+        return -1;
+
+    if (!(channel->revents & (POLLIN | POLLHUP)))
+        return 0;
+
+    ssize_t n = read(channel->fd, (char *)buffer + *received,
+                     size - *received);
+
+    if (n == 0)
+        return -1;
+
+    if (n < 0)
+        return errno == EINTR ? 0 : -1;
+
+    *received += (size_t)n;
+
+    if (*received < size)
+        return 0;
+
+    *received = 0;
+    return 1;
+}
+
 void processing(void)
 {
+    struct pollfd channels[] = {
+        { .fd = pipefd[0], .events = POLLIN },  // Memory
+        { .fd = cpu_fd,    .events = POLLIN },  // CPU
+        { .fd = proc_fd,   .events = POLLIN }   // Processes
+    };
 
-    while(!stop_requested){
-      
-        MemData mem_data;
+    MemData mem_data;
+    size_t mem_received = 0;
+    CpuData cpu_data;
+    size_t cpu_received = 0;
 
-        if (read_full(pipefd[0], &mem_data, sizeof(mem_data)) != 1) {
-            fprintf(stderr, "Failed to read complete MemData\n");
+    ProcData proc_data;
+    size_t proc_received = 0;
+
+    while (!stop_requested) {
+        int ready = poll(channels, sizeof(channels) / sizeof(channels[0]), 1000);
+
+        if (stop_requested)
+            break;
+
+        if (ready == -1) {
+            if (errno == EINTR)
+                continue;
+
+            perror("poll");
             break;
         }
 
-        printf("=== Memory ===\n");
-        printf("MemTotal: %ld kB\n", mem_data.mem_total);
-        printf("MemFree: %ld kB\n", mem_data.mem_free);
-        printf("MemAvailable: %ld kB\n", mem_data.mem_avail);
-        printf("SwapTotal: %ld kB\n", mem_data.swap_total);
-        printf("SwapFree: %ld kB\n", mem_data.swap_free);
+        if (ready == 0)
+            continue;
+        
+        int mem_result = read_sample(&channels[0], &mem_data,
+                                    sizeof(mem_data), &mem_received);
 
-
-
-        CpuData cpu_data;
-
-        if (read_full(cpu_fd, &cpu_data, sizeof(cpu_data)) != 1) {
-            fprintf(stderr, "Failed to read complete CpuData\n");
+        if (mem_result < 0) {
+            fprintf(stderr, "Memory channel closed or read failed\n");
             break;
         }
 
-        printf("\n=== CPU ===\n");
-        printf("1 min load: %.2f\n", cpu_data.load1);
-        printf("5 min load: %.2f\n", cpu_data.load5);
-        printf("15 min load: %.2f\n", cpu_data.load15);
+        if (mem_result == 1) {
+            printf("=== Memory ===\n");
+            printf("MemTotal: %ld kB\n", mem_data.mem_total);
+            printf("MemFree: %ld kB\n", mem_data.mem_free);
+            printf("MemAvailable: %ld kB\n", mem_data.mem_avail);
+            printf("SwapTotal: %ld kB\n", mem_data.swap_total);
+            printf("SwapFree: %ld kB\n", mem_data.swap_free);
+        }
 
+        int cpu_result = read_sample(&channels[1], &cpu_data,
+                                    sizeof(cpu_data), &cpu_received);
 
-
-        ProcData proc_data;
-
-        if (read_full(proc_fd, &proc_data, sizeof(proc_data)) != 1) {
-            fprintf(stderr, "Failed to read complete ProcData\n");
+        if (cpu_result < 0) {
+            fprintf(stderr, "CPU channel closed or read failed\n");
             break;
         }
 
-        printf("\n=== Processes ===\n");
-        printf("Active processes: %d\n", proc_data.total_procs);
+        if (cpu_result == 1) {
+            printf("\n=== CPU ===\n");
+            printf("1 min load: %.2f\n", cpu_data.load1);
+            printf("5 min load: %.2f\n", cpu_data.load5);
+            printf("15 min load: %.2f\n", cpu_data.load15);
+        }
 
+        int proc_result = read_sample(&channels[2], &proc_data,
+                                     sizeof(proc_data), &proc_received);
 
+        if (proc_result < 0) {
+            fprintf(stderr, "Processes channel closed or read failed\n");
+            break;
+        }
+
+        if (proc_result == 1) {
+            printf("\n=== Processes ===\n");
+            printf("Active processes: %d\n", proc_data.total_procs);
+        }
 
     }
 }
 
-void teardown(void){
+void teardown(void)
+{
 
     kill(mem_pid, SIGTERM);
     kill(cpu_pid, SIGTERM);
@@ -225,8 +261,6 @@ int main(void)
 
     processing();
     teardown();
-
-
 
     return 0;
 }

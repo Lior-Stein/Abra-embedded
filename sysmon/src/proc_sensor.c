@@ -57,7 +57,7 @@ int main(void)
         fflush(fifo);
 
       
-        sleep(1);
+        sleep(30);
     }
     return 0;
 }

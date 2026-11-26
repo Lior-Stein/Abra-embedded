@@ -41,7 +41,7 @@ int main(void)
 
       
         fclose(file);
-        sleep(1);
+        sleep(20);
     }   
     return 0;
 }
