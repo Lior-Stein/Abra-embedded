@@ -9,144 +9,131 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <mqueue.h>
 
 extern char **environ;
-int pipefd[2];
-int cpu_fd, proc_fd;
-pid_t mem_pid, cpu_pid, proc_pid;
+static mqd_t mem_queue = (mqd_t)-1;
+static mqd_t cpu_queue = (mqd_t)-1;
+static mqd_t proc_queue = (mqd_t)-1;
 
-int read_full(int fd, void *buffer, size_t size)
-{
-    size_t total = 0;
+static pid_t mem_pid = -1;
+static pid_t cpu_pid = -1;
+static pid_t proc_pid = -1;
 
-    while (total < size) {
-        ssize_t n = read(fd, (char *)buffer + total, size - total);
-
-        if (n == 0)
-            return 0;
-
-        if (n < 0)
-            return -1;
-
-        total += n;
-    }
-
-    return 1;
-}
 
 volatile sig_atomic_t stop_requested = 0;
 
 void stop_handler(int sig)
 {
+    (void)sig;
     stop_requested = 1;
 }
 
 
+static mqd_t create_queue(const char *name, size_t message_size)
+{
+    if (mq_unlink(name) == -1 && errno != ENOENT) {
+        perror("mq_unlink");
+        return (mqd_t)-1;
+    }
+
+    struct mq_attr attr = {
+        .mq_maxmsg = MAX_MESSAGES,
+        .mq_msgsize = (long)message_size
+    };
+
+    mqd_t queue = mq_open(name, O_CREAT | O_RDONLY, 0666, &attr);
+    if (queue == (mqd_t)-1)
+        perror(name);
+
+    return queue;
+}
+
+static pid_t spawn_sensor(char *path)
+{
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        return -1;
+    }
+
+    if (pid == 0) {
+        mq_close(mem_queue);
+        mq_close(cpu_queue);
+        mq_close(proc_queue);
+
+        char *args[] = {path, NULL};
+        execve(path, args, environ);
+
+        perror(path);
+        _exit(1);
+    }
+
+    return pid;
+}
+
 int init(void)
 {
-
     struct sigaction sa = {0};
     sa.sa_handler = stop_handler;
     sigemptyset(&sa.sa_mask);
 
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-
-
-    if (pipe(pipefd) == -1) {
-        perror("pipe");
+    if (sigaction(SIGINT, &sa, NULL) == -1 ||
+        sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction");
         return 1;
     }
 
-
-    mem_pid = fork();
-
-    if (mem_pid == -1) {
-        perror("fork");
-        close(pipefd[0]);
-        close(pipefd[1]);
+    mem_queue = create_queue(MEM_QUEUE_NAME, sizeof(MemData));
+    if (mem_queue == (mqd_t)-1)
         return 1;
-    }
 
-    if (mem_pid == 0) {
-        close(pipefd[0]);
-
-        if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
-            perror("dup2");
-            _exit(1);
-        }
-
-        close(pipefd[1]);
-
-        char *args[] = {"./bin/mem_sensor", NULL};
-        execve("./bin/mem_sensor", args, environ);
-
-        perror("execve");
-        _exit(1);
-    }
-
-    close(pipefd[1]);
-
-    if (mkfifo(CPU_FIFO_PATH, 0666) == -1 && errno != EEXIST) {
-    perror("mkfifo CPU");
-    return 1;
-    }
-
-    if (mkfifo(PROC_FIFO_PATH, 0666) == -1 && errno != EEXIST) {
-        perror("mkfifo PROC");
+    cpu_queue = create_queue(CPU_QUEUE_NAME, sizeof(CpuData));
+    if (cpu_queue == (mqd_t)-1)
         return 1;
-    }
 
-
-    cpu_pid = fork();
-
-    if (cpu_pid == -1) {
-        perror("fork cpu");
+    proc_queue = create_queue(PROC_QUEUE_NAME, sizeof(ProcData));
+    if (proc_queue == (mqd_t)-1)
         return 1;
-    }
 
-    if (cpu_pid == 0) {
-        close(pipefd[0]);
-
-        char *args[] = {"./bin/cpu_sensor", NULL};
-        execve("./bin/cpu_sensor", args, environ);
-
-        perror("execve cpu_sensor");
-        _exit(1);
-    }
-
-    proc_pid = fork();
-
-    if (proc_pid == -1) {
-        perror("fork proc");
+    mem_pid = spawn_sensor("./bin/mem_sensor");
+    if (mem_pid == -1)
         return 1;
-    }
 
-    if (proc_pid == 0) {
-        close(pipefd[0]);
-
-        char *args[] = {"./bin/proc_sensor", NULL};
-        execve("./bin/proc_sensor", args, environ);
-
-        perror("execve proc_sensor");
-        _exit(1);
-    }
-
-
-    cpu_fd = open(CPU_FIFO_PATH, O_RDONLY);
-
-    if (cpu_fd == -1) {
-        perror("open CPU FIFO");
+    cpu_pid = spawn_sensor("./bin/cpu_sensor");
+    if (cpu_pid == -1)
         return 1;
-    }
 
-    proc_fd = open(PROC_FIFO_PATH, O_RDONLY);
-
-    if (proc_fd == -1) {
-        perror("open PROC FIFO");
+    proc_pid = spawn_sensor("./bin/proc_sensor");
+    if (proc_pid == -1)
         return 1;
-    }
+
     return 0;
+}
+
+static int receive_sample(mqd_t queue, void *data, size_t size,
+                          unsigned int *priority)
+{
+    if (stop_requested)
+        return 0;
+
+    ssize_t received = mq_receive(queue, data, size, priority);
+
+    if (stop_requested)
+        return 0;
+
+    if (received == -1) {
+        perror("mq_receive");
+        return 0;
+    }
+
+    if (received != (ssize_t)size) {
+        fprintf(stderr, "Unexpected message size\n");
+        return 0;
+    }
+
+    return 1;
 }
 
 void processing(void)
@@ -155,13 +142,12 @@ void processing(void)
     while(!stop_requested){
       
         MemData mem_data;
+        unsigned int priority;
 
-        if (read_full(pipefd[0], &mem_data, sizeof(mem_data)) != 1) {
-            fprintf(stderr, "Failed to read complete MemData\n");
+       if (!receive_sample(mem_queue, &mem_data, sizeof(mem_data), &priority))
             break;
-        }
 
-        printf("=== Memory ===\n");
+        printf("=== Memory (PID %ld, Priority %u) ===\n",(long)mem_pid, priority);
         printf("MemTotal: %ld kB\n", mem_data.mem_total);
         printf("MemFree: %ld kB\n", mem_data.mem_free);
         printf("MemAvailable: %ld kB\n", mem_data.mem_avail);
@@ -172,12 +158,10 @@ void processing(void)
 
         CpuData cpu_data;
 
-        if (read_full(cpu_fd, &cpu_data, sizeof(cpu_data)) != 1) {
-            fprintf(stderr, "Failed to read complete CpuData\n");
+        if (!receive_sample(cpu_queue, &cpu_data, sizeof(cpu_data), &priority))
             break;
-        }
 
-        printf("\n=== CPU ===\n");
+        printf("\n=== CPU (PID %ld, Priority %u) ===\n",(long)cpu_pid, priority);
         printf("1 min load: %.2f\n", cpu_data.load1);
         printf("5 min load: %.2f\n", cpu_data.load5);
         printf("15 min load: %.2f\n", cpu_data.load15);
@@ -186,12 +170,10 @@ void processing(void)
 
         ProcData proc_data;
 
-        if (read_full(proc_fd, &proc_data, sizeof(proc_data)) != 1) {
-            fprintf(stderr, "Failed to read complete ProcData\n");
+        if (!receive_sample(proc_queue, &proc_data, sizeof(proc_data), &priority))
             break;
-        }
 
-        printf("\n=== Processes ===\n");
+        printf("\n=== Processes (PID %ld, Priority %u) ===\n",(long)proc_pid, priority);
         printf("Active processes: %d\n", proc_data.total_procs);
 
 
@@ -199,34 +181,45 @@ void processing(void)
     }
 }
 
-void teardown(void){
+static void remove_queue(mqd_t queue, const char *name)
+{
+    if (queue == (mqd_t)-1)
+        return;
 
-    kill(mem_pid, SIGTERM);
-    kill(cpu_pid, SIGTERM);
-    kill(proc_pid, SIGTERM);
-
-    waitpid(mem_pid, NULL, 0);
-    waitpid(cpu_pid, NULL, 0);
-    waitpid(proc_pid, NULL, 0);
-
-    close(pipefd[0]);
-    close(cpu_fd);
-    close(proc_fd);
-
-    unlink(CPU_FIFO_PATH);
-    unlink(PROC_FIFO_PATH);
+    mq_close(queue);
+    mq_unlink(name);
 }
 
+void teardown(void)
+{
+    pid_t pids[] = {mem_pid, cpu_pid, proc_pid};
+    size_t count = sizeof(pids) / sizeof(pids[0]);
+
+    for (size_t i = 0; i < count; i++) {
+        if (pids[i] > 0)
+            kill(pids[i], SIGTERM);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        if (pids[i] > 0) {
+            while (waitpid(pids[i], NULL, 0) == -1 && errno == EINTR) {
+                /* Retry if the wait was interrupted by a signal. */
+            }
+        }
+    }
+
+    remove_queue(mem_queue, MEM_QUEUE_NAME);
+    remove_queue(cpu_queue, CPU_QUEUE_NAME);
+    remove_queue(proc_queue, PROC_QUEUE_NAME);
+}
 
 int main(void)
 {
-    if (init() != 0)
-        return 1;
+    int status = init();
 
-    processing();
+    if (status == 0)
+        processing();
+
     teardown();
-
-
-
-    return 0;
+    return status;
 }

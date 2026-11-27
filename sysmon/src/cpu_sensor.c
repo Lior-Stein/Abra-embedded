@@ -1,47 +1,85 @@
-
+#include <errno.h>
+#include <fcntl.h>
+#include <mqueue.h>
+#include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sysmon_ipc.h>
-#include <fcntl.h>
+
+static volatile sig_atomic_t stop_requested = 0;
+
+static void stop_handler(int sig)
+{
+    (void)sig;
+    stop_requested = 1;
+}
+
+static int read_loadavg(CpuData *data)
+{
+    FILE *file = fopen("/proc/loadavg", "r");
+    if (file == NULL) {
+        perror("fopen /proc/loadavg");
+        return -1;
+    }
+
+    int fields = fscanf(file, "%lf %lf %lf",
+                        &data->load1, &data->load5, &data->load15);
+    fclose(file);
+
+    return fields == 3;
+}
 
 int main(void)
 {
-    int fifo_fd = open(CPU_FIFO_PATH, O_WRONLY);
+    struct sigaction sa = {0};
+    sa.sa_handler = stop_handler;
+    sigemptyset(&sa.sa_mask);
 
-    if (fifo_fd == -1) {
-        perror("open CPU FIFO");
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
+        perror("sigaction SIGTERM");
         return 1;
     }
 
-    FILE *fifo = fdopen(fifo_fd, "w");
-
-    if (fifo == NULL) {
-        perror("fdopen");
-        close(fifo_fd);
+    mqd_t queue = mq_open(CPU_QUEUE_NAME, O_WRONLY);
+    if (queue == (mqd_t)-1) {
+        perror("mq_open " CPU_QUEUE_NAME);
         return 1;
     }
 
-    while (1) {
-        FILE *file = fopen("/proc/loadavg", "r");
+    int status = 0;
 
-        if (file == NULL) {
-            perror("fopen");
-            return 1;
+    while (!stop_requested) {
+        CpuData data = {0};
+
+        int result = read_loadavg(&data);
+
+        if (result == -1) {
+            status = 1;
+            break;
         }
 
+        if (stop_requested)
+            break;
 
-        double load1, load5, load15;
-
-        if (fscanf(file, "%lf %lf %lf", &load1, &load5, &load15) == 3) {
-            CpuData data = {load1, load5, load15};
-            
-            fwrite(&data, sizeof(data), 1, fifo);
-            fflush(fifo);
+        if (result == 0) {
+            sleep(1);
+            continue;
         }
 
-      
-        fclose(file);
+        unsigned int priority = (data.load1 > 1.50) ? 10U : 1U;
+
+        if (mq_send(queue, (const char *)&data, sizeof(data), priority) == -1) {
+            if (errno == EINTR)
+                continue;
+
+            perror("mq_send");
+            status = 1;
+            break;
+        }
+
         sleep(1);
-    }   
-    return 0;
+    }
+
+    mq_close(queue);
+    return status;
 }
